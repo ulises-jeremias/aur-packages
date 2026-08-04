@@ -1,0 +1,144 @@
+# Generic AUR package updater.
+# Triggered via repository_dispatch from any package repo.
+# Payload: { package_name: "agent-toolkit", version: "1.0.0" }
+name: Update AUR Package
+
+on:
+  repository_dispatch:
+    types: [new-release]
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: Package name (e.g. agent-toolkit)
+        required: true
+      version:
+        description: New version (e.g. 1.0.0)
+        required: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve inputs
+        id: inputs
+        run: |
+          PKG="${{ github.event.client_payload.package_name || github.event.inputs.package_name }}"
+          VERSION="${{ github.event.client_payload.version || github.event.inputs.version }}"
+          echo "package_name=$PKG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Package: $PKG  Version: $VERSION"
+
+      - name: Validate package directory exists
+        run: |
+          PKG="${{ steps.inputs.outputs.package_name }}"
+          if [ ! -d "$PKG" ]; then
+            echo "::error::Package directory not found: $PKG"
+            exit 1
+          fi
+          if [ ! -f "$PKG/PKGBUILD" ]; then
+            echo "::error::PKGBUILD not found in $PKG/"
+            exit 1
+          fi
+
+      - name: Detect source URL and compute SHA256
+        id: source
+        run: |
+          PKG="${{ steps.inputs.outputs.package_name }}"
+          VERSION="${{ steps.inputs.outputs.version }}"
+
+          # Detect source type from PKGBUILD source= line
+          SOURCE_LINE=$(grep '^source=' "$PKG/PKGBUILD" | head -1)
+          echo "Source line: $SOURCE_LINE"
+
+          if echo "$SOURCE_LINE" | grep -q "github.com"; then
+            URL="https://github.com/ulises-jeremias/${PKG}/archive/refs/tags/v${VERSION}.tar.gz"
+          elif echo "$SOURCE_LINE" | grep -q "pypi"; then
+            PYPI_NAME=$(echo "$PKG" | tr '-' '_')
+            URL="https://files.pythonhosted.org/packages/source/${PYPI_NAME:0:1}/${PYPI_NAME}/${PYPI_NAME}-${VERSION}.tar.gz"
+          elif echo "$SOURCE_LINE" | grep -q "registry.npmjs.org"; then
+            URL="https://registry.npmjs.org/${PKG}/-/${PKG}-${VERSION}.tgz"
+          else
+            echo "::error::Cannot detect source type"
+            exit 1
+          fi
+
+          echo "Fetching: $URL"
+          SHA256=""
+          for attempt in $(seq 1 24); do
+            if curl -fsSL --retry 3 "$URL" -o /tmp/pkg-src.tar.gz 2>/dev/null; then
+              SHA256=$(sha256sum /tmp/pkg-src.tar.gz | awk '{print $1}')
+              EMPTY_SHA="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              if [ "$SHA256" != "$EMPTY_SHA" ] && [ -n "$SHA256" ]; then
+                echo "SHA256: $SHA256"; break
+              fi
+            fi
+            if [ "$attempt" = "24" ]; then echo "::error::Failed after 24 attempts"; exit 1; fi
+            echo "::warning::Attempt $attempt/24 failed, retrying in 15s..."; sleep 15
+          done
+
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Update PKGBUILD
+        run: |
+          PKG="${{ steps.inputs.outputs.package_name }}"
+          VERSION="${{ steps.inputs.outputs.version }}"
+          SHA256="${{ steps.source.outputs.sha256 }}"
+
+          sed -i "s/^pkgver=.*/pkgver=$VERSION/" "$PKG/PKGBUILD"
+          sed -i "s/^pkgrel=.*/pkgrel=1/" "$PKG/PKGBUILD"
+          sed -i "s/sha256sums=('.*')/sha256sums=('$SHA256')/" "$PKG/PKGBUILD"
+
+          echo "Updated $PKG/PKGBUILD:"
+          grep -E '^(pkgver|pkgrel|sha256sums)=' "$PKG/PKGBUILD"
+
+      - name: Set up AUR SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          cat >> ~/.ssh/config << 'SSHEOF'
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User aur
+          SSHEOF
+
+      - name: Publish to AUR
+        uses: ulises-jeremias/github-actions-aur-publish@v1
+        with:
+          pkgname: ${{ steps.inputs.outputs.package_name }}
+          pkgbuild: ${{ steps.inputs.outputs.package_name }}/PKGBUILD
+          commit_username: "ulises-jeremias-bot"
+          commit_email: "ulisescf.24@gmail.com"
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          force_push: "true"
+          allow_empty_commits: "false"
+
+      - name: Verify AUR publication
+        run: |
+          PKG="${{ steps.inputs.outputs.package_name }}"
+          VERSION="${{ steps.inputs.outputs.version }}"
+          echo "Verifying AUR RPC for $PKG@$VERSION..."
+          for attempt in $(seq 1 6); do
+            AUR_VER=$(curl -fsSL "https://aur.archlinux.org/rpc/v5/info?arg=${PKG}" \
+              | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['results'][0]['Version'] if d['results'] else 'not_found')" 2>/dev/null || echo "error")
+            if [ "$AUR_VER" = "$VERSION-1" ]; then
+              echo "✓ AUR shows $PKG@$AUR_VER"
+              break
+            fi
+            echo "Attempt $attempt/6: AUR shows '$AUR_VER', expected '$VERSION-1' — waiting 20s..."
+            sleep 20
+          done
+
+      - name: Sync PKGBUILD to GitHub mirror
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(${{ steps.inputs.outputs.package_name }}): sync PKGBUILD to v${{ steps.inputs.outputs.version }}"
+          commit_user_name: "ulises-jeremias-bot"
+          commit_user_email: "ulisescf.24@gmail.com"
+          file_pattern: "${{ steps.inputs.outputs.package_name }}/PKGBUILD"
