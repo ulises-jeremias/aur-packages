@@ -19,6 +19,8 @@ jobs:
   update:
     runs-on: ubuntu-latest
     environment: aur
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -119,6 +121,8 @@ jobs:
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           force_push: "true"
           allow_empty_commits: "false"
+          # OpenSSH on current runners rejects DSA (removed upstream)
+          ssh_keyscan_types: "rsa,ecdsa,ed25519"
 
       - name: Verify AUR publication
         run: |
