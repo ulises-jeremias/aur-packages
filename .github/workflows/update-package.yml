@@ -1,6 +1,11 @@
 # Generic AUR package updater.
 # Triggered via repository_dispatch from any package repo.
 # Payload: { package_name: "agent-toolkit", version: "1.0.0" }
+#
+# Order matters for resilience:
+#   1) Patch PKGBUILD + sync GitHub mirror FIRST (always durable)
+#   2) Publish to AUR with long retries (handles Arch maintenance)
+#   3) Verify AUR RPC (hard fail if never visible)
 name: Update AUR Package
 
 on:
@@ -14,6 +19,10 @@ on:
       version:
         description: New version (e.g. 1.0.0)
         required: true
+
+concurrency:
+  group: update-aur-${{ github.event.client_payload.package_name || github.event.inputs.package_name || 'unknown' }}
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -31,6 +40,14 @@ jobs:
         run: |
           PKG="${{ github.event.client_payload.package_name || github.event.inputs.package_name }}"
           VERSION="${{ github.event.client_payload.version || github.event.inputs.version }}"
+          if [ -z "$PKG" ] || [ -z "$VERSION" ]; then
+            echo "::error::package_name and version are required (got package='$PKG' version='$VERSION')"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([a-zA-Z0-9.+-]+)?$'; then
+            echo "::error::Invalid version: $VERSION"
+            exit 1
+          fi
           echo "package_name=$PKG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Package: $PKG  Version: $VERSION"
@@ -53,7 +70,6 @@ jobs:
           PKG="${{ steps.inputs.outputs.package_name }}"
           VERSION="${{ steps.inputs.outputs.version }}"
 
-          # Detect source type from PKGBUILD source= line
           SOURCE_LINE=$(grep '^source=' "$PKG/PKGBUILD" | head -1)
           echo "Source line: $SOURCE_LINE"
 
@@ -71,16 +87,20 @@ jobs:
 
           echo "Fetching: $URL"
           SHA256=""
-          for attempt in $(seq 1 24); do
-            if curl -fsSL --retry 3 "$URL" -o /tmp/pkg-src.tar.gz 2>/dev/null; then
+          for attempt in $(seq 1 36); do
+            if curl -fsSL --retry 3 --retry-delay 2 "$URL" -o /tmp/pkg-src.tar.gz; then
               SHA256=$(sha256sum /tmp/pkg-src.tar.gz | awk '{print $1}')
               EMPTY_SHA="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-              if [ "$SHA256" != "$EMPTY_SHA" ] && [ -n "$SHA256" ]; then
-                echo "SHA256: $SHA256"; break
+              SIZE=$(wc -c </tmp/pkg-src.tar.gz)
+              if [ "$SHA256" != "$EMPTY_SHA" ] && [ -n "$SHA256" ] && [ "$SIZE" -gt 100 ]; then
+                echo "SHA256: $SHA256 (size=$SIZE)"; break
               fi
             fi
-            if [ "$attempt" = "24" ]; then echo "::error::Failed after 24 attempts"; exit 1; fi
-            echo "::warning::Attempt $attempt/24 failed, retrying in 15s..."; sleep 15
+            if [ "$attempt" = "36" ]; then
+              echo "::error::Failed after 36 attempts"
+              exit 1
+            fi
+            echo "::warning::Attempt $attempt/36 failed, retrying in 15s..."; sleep 15
           done
 
           echo "url=$URL" >> "$GITHUB_OUTPUT"
@@ -98,20 +118,30 @@ jobs:
 
           echo "Updated $PKG/PKGBUILD:"
           grep -E '^(pkgver|pkgrel|sha256sums)=' "$PKG/PKGBUILD"
+          grep -E '^pkgver=' "$PKG/PKGBUILD" | grep -qF "$VERSION"
 
-      - name: Set up AUR SSH
+      - name: Sync PKGBUILD to GitHub mirror (before AUR)
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(${{ steps.inputs.outputs.package_name }}): sync PKGBUILD to v${{ steps.inputs.outputs.version }}"
+          commit_user_name: "ulises-jeremias-bot"
+          commit_user_email: "ulisescf.24@gmail.com"
+          file_pattern: "${{ steps.inputs.outputs.package_name }}/PKGBUILD"
+          push_options: --force-with-lease
+
+      - name: Probe AUR availability
+        id: aur_status
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
-          chmod 600 ~/.ssh/aur
-          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
-          cat >> ~/.ssh/config << 'SSHEOF'
-          Host aur.archlinux.org
-            IdentityFile ~/.ssh/aur
-            User aur
-          SSHEOF
+          # Soft probe — do not fail the job; publish step retries hard.
+          MSG=$(curl -fsSL https://aur.archlinux.org/ 2>/dev/null | head -c 2000 || true)
+          if echo "$MSG" | grep -qi 'maintenance'; then
+            echo "AUR web UI indicates maintenance"
+            echo "maintenance=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "maintenance=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Publish to AUR
+      - name: Publish to AUR (retry through maintenance)
         uses: ulises-jeremias/github-actions-aur-publish@v1
         with:
           pkgname: ${{ steps.inputs.outputs.package_name }}
@@ -121,29 +151,27 @@ jobs:
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           force_push: "true"
           allow_empty_commits: "false"
-          # OpenSSH on current runners rejects DSA (removed upstream)
+          # OpenSSH on current runners rejects DSA
           ssh_keyscan_types: "rsa,ecdsa,ed25519"
+          # Long retry window for Arch maintenance windows
+          push_retries: "40"
+          push_retry_seconds: "30"
 
-      - name: Verify AUR publication
+      - name: Verify AUR publication (hard fail)
         run: |
           PKG="${{ steps.inputs.outputs.package_name }}"
           VERSION="${{ steps.inputs.outputs.version }}"
-          echo "Verifying AUR RPC for $PKG@$VERSION..."
-          for attempt in $(seq 1 6); do
+          EXPECTED="${VERSION}-1"
+          echo "Verifying AUR RPC for $PKG@$EXPECTED..."
+          for attempt in $(seq 1 18); do
             AUR_VER=$(curl -fsSL "https://aur.archlinux.org/rpc/v5/info?arg=${PKG}" \
-              | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['results'][0]['Version'] if d['results'] else 'not_found')" 2>/dev/null || echo "error")
-            if [ "$AUR_VER" = "$VERSION-1" ]; then
+              | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['results'][0]['Version'] if d.get('results') else 'not_found')" 2>/dev/null || echo "error")
+            if [ "$AUR_VER" = "$EXPECTED" ]; then
               echo "✓ AUR shows $PKG@$AUR_VER"
-              break
+              exit 0
             fi
-            echo "Attempt $attempt/6: AUR shows '$AUR_VER', expected '$VERSION-1' — waiting 20s..."
+            echo "Attempt $attempt/18: AUR shows '$AUR_VER', expected '$EXPECTED' — waiting 20s..."
             sleep 20
           done
-
-      - name: Sync PKGBUILD to GitHub mirror
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore(${{ steps.inputs.outputs.package_name }}): sync PKGBUILD to v${{ steps.inputs.outputs.version }}"
-          commit_user_name: "ulises-jeremias-bot"
-          commit_user_email: "ulisescf.24@gmail.com"
-          file_pattern: "${{ steps.inputs.outputs.package_name }}/PKGBUILD"
+          echo "::error::AUR never showed $PKG@$EXPECTED — yay will not find this package"
+          exit 1
