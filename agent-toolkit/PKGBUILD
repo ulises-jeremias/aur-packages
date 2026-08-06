@@ -13,6 +13,11 @@ sha256sums=('1d23e5ca818c39c07095d79cabda4c376c612ba81339cf59bb6e4c6d2bdab409')
 
 build() {
     cd "$pkgname-$pkgver"
+    # Ensure bundled data is present for the wheel (source tarball needs prepare; PyPI wheels already contain it)
+    # See https://github.com/ulises-jeremias/agent-toolkit/issues/258 (coordinate with #244)
+    if [ -f scripts/prepare-package-data.sh ]; then
+        bash scripts/prepare-package-data.sh
+    fi
     python -m build --wheel --no-isolation
 }
 
