@@ -1,6 +1,6 @@
 # Maintainer: Ulises Jeremias Cornejo Fandos <ulisescf.24@gmail.com>
 pkgname=agent-toolkit
-pkgver=1.6.0
+pkgver=1.8.0
 pkgrel=1
 pkgdesc="Composable AI agent toolkit — loops, skills, profiles for Claude Code, Cursor, OpenCode, Windsurf, and more"
 arch=('any')
@@ -9,7 +9,7 @@ license=('MIT')
 depends=('python>=3.10')
 makedepends=('python-build' 'python-installer' 'python-wheel' 'python-hatchling')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/ulises-jeremias/$pkgname/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('081dc97781f960590c9aee35ed237bfe68bcebed28e6e95b3b1d30e6929554cc')
+sha256sums=('d809296cdfb05993aae30a29f50feb3edf5dd05c2e7e8392d99f041db0b455e2')
 
 build() {
     cd "$pkgname-$pkgver"
