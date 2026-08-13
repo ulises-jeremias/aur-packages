@@ -64,60 +64,45 @@ jobs:
             exit 1
           fi
 
-      - name: Detect source URL and compute SHA256
-        id: source
+      - name: Update PKGBUILD
+        env:
+          PACKAGE_NAME: ${{ steps.inputs.outputs.package_name }}
+          VERSION: ${{ steps.inputs.outputs.version }}
         run: |
-          PKG="${{ steps.inputs.outputs.package_name }}"
-          VERSION="${{ steps.inputs.outputs.version }}"
-
-          SOURCE_LINE=$(grep '^source=' "$PKG/PKGBUILD" | head -1)
-          echo "Source line: $SOURCE_LINE"
-
-          if echo "$SOURCE_LINE" | grep -q "github.com"; then
-            URL="https://github.com/ulises-jeremias/${PKG}/archive/refs/tags/v${VERSION}.tar.gz"
-          elif echo "$SOURCE_LINE" | grep -q "pypi"; then
-            PYPI_NAME=$(echo "$PKG" | tr '-' '_')
-            URL="https://files.pythonhosted.org/packages/source/${PYPI_NAME:0:1}/${PYPI_NAME}/${PYPI_NAME}-${VERSION}.tar.gz"
-          elif echo "$SOURCE_LINE" | grep -q "registry.npmjs.org"; then
-            URL="https://registry.npmjs.org/${PKG}/-/${PKG}-${VERSION}.tgz"
+          set -euo pipefail
+          PKG="$PACKAGE_NAME"
+          if grep -q 'releases/download/' "$PKG/PKGBUILD"; then
+            python3 scripts/patch_pkgbuild.py
           else
-            echo "::error::Cannot detect source type"
-            exit 1
-          fi
-
-          echo "Fetching: $URL"
-          SHA256=""
-          for attempt in $(seq 1 36); do
-            if curl -fsSL --retry 3 --retry-delay 2 "$URL" -o /tmp/pkg-src.tar.gz; then
-              SHA256=$(sha256sum /tmp/pkg-src.tar.gz | awk '{print $1}')
-              EMPTY_SHA="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-              SIZE=$(wc -c </tmp/pkg-src.tar.gz)
-              if [ "$SHA256" != "$EMPTY_SHA" ] && [ -n "$SHA256" ] && [ "$SIZE" -gt 100 ]; then
-                echo "SHA256: $SHA256 (size=$SIZE)"; break
-              fi
-            fi
-            if [ "$attempt" = "36" ]; then
-              echo "::error::Failed after 36 attempts"
+            SOURCE_LINE=$(grep '^source=' "$PKG/PKGBUILD" | head -1)
+            if echo "$SOURCE_LINE" | grep -q "github.com"; then
+              UPSTREAM="${PKG%-bin}"
+              URL="https://github.com/ulises-jeremias/${UPSTREAM}/archive/refs/tags/v${VERSION}.tar.gz"
+            else
+              echo "::error::Cannot detect source type"
               exit 1
             fi
-            echo "::warning::Attempt $attempt/36 failed, retrying in 15s..."; sleep 15
-          done
-
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
-
-      - name: Update PKGBUILD
-        run: |
-          PKG="${{ steps.inputs.outputs.package_name }}"
-          VERSION="${{ steps.inputs.outputs.version }}"
-          SHA256="${{ steps.source.outputs.sha256 }}"
-
-          sed -i "s/^pkgver=.*/pkgver=$VERSION/" "$PKG/PKGBUILD"
-          sed -i "s/^pkgrel=.*/pkgrel=1/" "$PKG/PKGBUILD"
-          sed -i "s/sha256sums=('.*')/sha256sums=('$SHA256')/" "$PKG/PKGBUILD"
-
+            SHA256=""
+            for attempt in $(seq 1 36); do
+              if curl -fsSL --retry 3 --retry-delay 2 "$URL" -o /tmp/pkg-src.tar.gz; then
+                SHA256=$(sha256sum /tmp/pkg-src.tar.gz | awk '{print $1}')
+                SIZE=$(wc -c </tmp/pkg-src.tar.gz)
+                if [ "$SHA256" != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ] && [ "$SIZE" -gt 100 ]; then
+                  break
+                fi
+              fi
+              if [ "$attempt" = "36" ]; then
+                echo "::error::Failed after 36 attempts"
+                exit 1
+              fi
+              sleep 15
+            done
+            sed -i "s/^pkgver=.*/pkgver=$VERSION/" "$PKG/PKGBUILD"
+            sed -i "s/^pkgrel=.*/pkgrel=1/" "$PKG/PKGBUILD"
+            sed -i "s/sha256sums=('.*')/sha256sums=('$SHA256')/" "$PKG/PKGBUILD"
+          fi
           echo "Updated $PKG/PKGBUILD:"
-          grep -E '^(pkgver|pkgrel|sha256sums)=' "$PKG/PKGBUILD"
+          grep -E '^(pkgver|pkgrel|sha256sums)' "$PKG/PKGBUILD"
           grep -E '^pkgver=' "$PKG/PKGBUILD" | grep -qF "$VERSION"
 
       - name: Sync PKGBUILD to GitHub mirror (before AUR)
@@ -126,7 +111,7 @@ jobs:
           commit_message: "chore(${{ steps.inputs.outputs.package_name }}): sync PKGBUILD to v${{ steps.inputs.outputs.version }}"
           commit_user_name: "ulises-jeremias-bot"
           commit_user_email: "ulisescf.24@gmail.com"
-          file_pattern: "${{ steps.inputs.outputs.package_name }}/PKGBUILD"
+          file_pattern: "${{ steps.inputs.outputs.package_name }}/*"
           push_options: --force-with-lease
 
       - name: Probe AUR availability

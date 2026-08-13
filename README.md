@@ -9,12 +9,16 @@
 
 | Package | AUR | Description |
 |---------|-----|-------------|
-| [agent-toolkit](agent-toolkit/PKGBUILD) | [agent-toolkit](https://aur.archlinux.org/packages/agent-toolkit) | Composable AI agent toolkit |
+| [agent-toolkit-bin](agent-toolkit-bin/PKGBUILD) | [agent-toolkit-bin](https://aur.archlinux.org/packages/agent-toolkit-bin) | **Canonical** — native V CLI from GitHub Releases |
+| [agent-toolkit](agent-toolkit/PKGBUILD) | [agent-toolkit](https://aur.archlinux.org/packages/agent-toolkit) | Optional Python/source package (not the V product) |
 
 ## Installation
 
 ```bash
-# Using yay
+# Canonical (native V binary)
+yay -S agent-toolkit-bin
+
+# Optional Python/source package
 yay -S agent-toolkit
 
 # Manual (any package)
