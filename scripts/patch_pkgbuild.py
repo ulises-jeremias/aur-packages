@@ -77,6 +77,11 @@ def _download_manifest_sha256(url: str) -> str:
                 _, arch = platform.group(1).split("-", 1)
                 entry = _select_archive(manifest, filename, "linux", arch, "gnu")
                 return _verified_asset_sha(entry, data)
+        except urllib.error.HTTPError as exc:
+            if 400 <= exc.code < 500 and exc.code != 429:
+                raise SystemExit(f"{url} HTTP {exc.code}") from exc
+            last_err = exc
+            print(f"attempt {attempt}/36 {url}: HTTP {exc.code}")
         except (OSError, TimeoutError, urllib.error.URLError) as exc:
             last_err = exc
             print(f"attempt {attempt}/36 {url}: {exc}")
