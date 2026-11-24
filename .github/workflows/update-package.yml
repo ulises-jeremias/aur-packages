@@ -9,6 +9,11 @@
 name: Update AUR Package
 
 on:
+  pull_request:
+    paths:
+      - "agent-toolkit-bin/**"
+      - "scripts/**"
+      - ".github/workflows/update-package.yml"
   repository_dispatch:
     types: [new-release]
   workflow_dispatch:
@@ -25,7 +30,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test PKGBUILD updater validation
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+
   update:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment: aur
     permissions:
